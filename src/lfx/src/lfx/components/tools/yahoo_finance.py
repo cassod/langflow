@@ -1,5 +1,11 @@
 import ast
 import pprint
+import time
+import hashlib
+import json
+import os
+import threading
+import random
 from enum import Enum
 
 from langchain.tools import StructuredTool
@@ -11,6 +17,132 @@ from lfx.field_typing import Tool
 from lfx.inputs.inputs import DropdownInput, IntInput, MessageTextInput
 from lfx.log.logger import logger
 from lfx.schema.data import Data
+
+# Configuration (can be adjusted)
+# RATE_PER_MIN: number of allowed yfinance calls per minute (per-process)
+RATE_PER_MIN = int(os.environ.get("YFINANCE_RATE_PER_MIN", "10"))
+TOKEN_BUCKET_CAPACITY = float(os.environ.get("YFINANCE_TOKEN_CAPACITY", "2"))
+CACHE_TTL_SECONDS = int(os.environ.get("YFINANCE_CACHE_TTL_SECONDS", str(60 * 60)))  # default 1 hour
+CACHE_MAX_ENTRIES = int(os.environ.get("YFINANCE_CACHE_MAX_ENTRIES", "512"))
+
+# Simple in-memory TTL cache for history results
+# Structure: _history_cache[cache_key] = (timestamp_seconds, records)
+_history_cache: dict[str, tuple[float, object]] = {}
+
+
+def _make_cache_key_for_history(symbol: str, start_date: str | None, end_date: str | None, period: str, interval: str) -> str:
+    raw = f"{symbol}|{start_date or ''}|{end_date or ''}|{period}|{interval}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _get_cached_history(cache_key: str):
+    entry = _history_cache.get(cache_key)
+    if not entry:
+        return None
+    ts, records = entry
+    if time.time() - ts > CACHE_TTL_SECONDS:
+        # expired
+        try:
+            del _history_cache[cache_key]
+        except KeyError:
+            pass
+        return None
+    return records
+
+
+def _set_cached_history(cache_key: str, records: object):
+    # Simple eviction if cache grows too big (remove oldest)
+    if len(_history_cache) >= CACHE_MAX_ENTRIES:
+        # remove oldest entry
+        oldest_key = min(_history_cache.items(), key=lambda kv: kv[1][0])[0]
+        try:
+            del _history_cache[oldest_key]
+        except KeyError:
+            pass
+    _history_cache[cache_key] = (time.time(), records)
+
+
+# Token bucket rate limiter (per-process)
+class TokenBucket:
+    def __init__(self, rate_per_min: float, capacity: float):
+        # rate_per_min: tokens added per minute
+        self.rate_per_sec = float(rate_per_min) / 60.0
+        self.capacity = float(capacity)
+        self._tokens = self.capacity
+        self._last = time.time()
+        self._lock = threading.Lock()
+
+    def _add_tokens(self):
+        now = time.time()
+        elapsed = now - self._last
+        if elapsed <= 0:
+            return
+        added = elapsed * self.rate_per_sec
+        self._tokens = min(self.capacity, self._tokens + added)
+        self._last = now
+
+    def consume(self, tokens: float = 1.0) -> bool:
+        with self._lock:
+            self._add_tokens()
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return True
+            return False
+
+    def wait_for_token(self, tokens: float = 1.0, poll_sleep: float = 0.1):
+        # Wait until a token is available
+        while True:
+            if self.consume(tokens):
+                return
+            # small jitter to avoid thundering herd
+            time.sleep(poll_sleep + random.random() * 0.05)
+
+
+# Initialize a module-level token bucket
+_token_bucket = TokenBucket(rate_per_min=RATE_PER_MIN, capacity=TOKEN_BUCKET_CAPACITY)
+
+# Retry wrapper: try to use tenacity if available, otherwise a simple fallback
+try:
+    import tenacity
+
+    TENACITY_AVAILABLE = True
+except Exception:
+    TENACITY_AVAILABLE = False
+
+
+def _call_with_rate_and_retry(func, *args, **kwargs):
+    """
+    Consume a token, then call func with retries/backoff.
+    Uses tenacity if available; otherwise uses simple exponential backoff with jitter.
+    """
+    # Wait for token (rate limiting)
+    logger.debug("YahooFinance: waiting for rate token")
+    _token_bucket.wait_for_token()
+
+    if TENACITY_AVAILABLE:
+        # Use tenacity.Retrying to call the function with retry/backoff
+        retrying = tenacity.Retrying(
+            wait=tenacity.wait_exponential_jitter(initial=1, max=60),
+            stop=tenacity.stop_after_attempt(5),
+            retry=tenacity.retry_if_exception_type(Exception),
+            reraise=True,
+        )
+        return retrying.call(lambda: func(*args, **kwargs))
+    else:
+        # Fallback: simple retry loop
+        attempts = 5
+        delay = 1.0
+        for i in range(attempts):
+            try:
+                return func(*args, **kwargs)
+            except Exception:
+                if i == attempts - 1:
+                    raise
+                jitter = random.random() * 0.5
+                sleep_time = delay + jitter
+                logger.debug(f"YahooFinance: call failed, retrying in {sleep_time:.2f}s (attempt {i+1}/{attempts})")
+                time.sleep(sleep_time)
+                delay = min(delay * 2, 60.0)
 
 
 class YahooFinanceMethod(Enum):
@@ -39,12 +171,17 @@ class YahooFinanceMethod(Enum):
     GET_UPGRADES_DOWNGRADES = "get_upgrades_downgrades"
     GET_EARNINGS = "get_earnings"
     GET_INCOME_STMT = "get_income_stmt"
+    GET_HISTORY = "get_history"
 
 
 class YahooFinanceSchema(BaseModel):
     symbol: str = Field(..., description="The stock symbol to retrieve data for.")
     method: YahooFinanceMethod = Field(YahooFinanceMethod.GET_INFO, description="The type of data to retrieve.")
     num_news: int | None = Field(5, description="The number of news articles to retrieve.")
+    start_date: str | None = Field(None, description="Custom start date for historical data (YYYY-MM-DD).")
+    end_date: str | None = Field(None, description="Custom end date for historical data (YYYY-MM-DD).")
+    period: str = Field("1y", description="Default time period if no specific dates provided (e.g., 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max).")
+    interval: str = Field("1d", description="Data granularity (e.g., 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo).")
 
 
 class YfinanceToolComponent(LCToolComponent):
@@ -75,6 +212,56 @@ to access financial data and market information from Yahoo! Finance."""
             info="The number of news articles to retrieve (only applicable for get_news).",
             value=5,
         ),
+        MessageTextInput(
+            name="start_date",
+            display_name="Start Date",
+            info="Custom start date for historical data (YYYY-MM-DD). Optional.",
+        ),
+        MessageTextInput(
+            name="end_date",
+            display_name="End Date",
+            info="Custom end date for historical data (YYYY-MM-DD). Optional.",
+        ),
+        DropdownInput(
+            name="period",
+            display_name="Period",
+            info="Default time period if no specific dates provided.",
+            options=[
+                "1d",
+                "5d",
+                "1mo",
+                "3mo",
+                "6mo",
+                "1y",
+                "2y",
+                "5y",
+                "10y",
+                "ytd",
+                "max",
+            ],
+            value="1y",
+        ),
+        DropdownInput(
+            name="interval",
+            display_name="Interval",
+            info="Data granularity (e.g., 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo).",
+            options=[
+                "1m",
+                "2m",
+                "5m",
+                "15m",
+                "30m",
+                "60m",
+                "90m",
+                "1h",
+                "1d",
+                "5d",
+                "1wk",
+                "1mo",
+                "3mo",
+            ],
+            value="1d",
+        ),
     ]
 
     def run_model(self) -> list[Data]:
@@ -82,6 +269,10 @@ to access financial data and market information from Yahoo! Finance."""
             self.symbol,
             self.method,
             self.num_news,
+            self.start_date,
+            self.end_date,
+            self.period,
+            self.interval,
         )
 
     def build_tool(self) -> Tool:
@@ -97,34 +288,82 @@ to access financial data and market information from Yahoo! Finance."""
         symbol: str,
         method: YahooFinanceMethod,
         num_news: int | None = 5,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        period: str = "1y",
+        interval: str = "1d",
     ) -> list[Data]:
         try:
             import yfinance as yf
         except ImportError as e:
-            msg = ""
+            msg = "yfinance is required for YahooFinanceTool"
             raise ImportError(msg) from e
 
         ticker = yf.Ticker(symbol)
 
         try:
-            if method == YahooFinanceMethod.GET_INFO:
-                result = ticker.info
-            elif method == YahooFinanceMethod.GET_NEWS:
-                result = ticker.news[:num_news]
-            else:
-                result = getattr(ticker, method.value)()
+            # For history, check cache first (cache misses go through rate limiter and retry)
+            if method == YahooFinanceMethod.GET_HISTORY:
+                cache_key = _make_cache_key_for_history(symbol, start_date, end_date, period, interval)
+                cached = _get_cached_history(cache_key)
+                if cached is not None:
+                    logger.debug(f"YahooFinance: returning cached history for {symbol}")
+                    return [Data(data={"historical": cached})]
 
-            result = pprint.pformat(result)
+                # Define a callable to fetch history (so we can wrap it)
+                def _fetch_history():
+                    if start_date and end_date:
+                        return ticker.history(start=start_date, end=end_date, interval=interval)
+                    return ticker.history(period=period, interval=interval)
+
+                historical = _call_with_rate_and_retry(_fetch_history)
+
+                # Convert DataFrame to list of records (with index reset to include datetime)
+                try:
+                    records = historical.reset_index().to_dict(orient="records")
+                except Exception:
+                    records = pprint.pformat(historical)
+
+                # store in cache
+                try:
+                    _set_cached_history(cache_key, records)
+                except Exception:
+                    logger.debug("YahooFinance: failed to set cache (non-fatal)")
+
+                return [Data(data={"historical": records})]
+
+            # For other methods, we call through the rate-limited wrapper
+            if method == YahooFinanceMethod.GET_INFO:
+                result = _call_with_rate_and_retry(lambda: ticker.info)
+                result = pprint.pformat(result)
+                return [Data(data={"result": result})]
 
             if method == YahooFinanceMethod.GET_NEWS:
-                data_list = [Data(data=article) for article in ast.literal_eval(result)]
-            else:
-                data_list = [Data(data={"result": result})]
+                # news may be a list; fetch via rate-limited wrapper
+                result = _call_with_rate_and_retry(lambda: ticker.news)
+                # slice if num_news provided
+                if isinstance(result, list) and num_news is not None:
+                    result = result[:num_news]
+                # preserve previous behavior of formatting then literal-eval if needed
+                # but if result is already list/dict we can return directly
+                if isinstance(result, (list, dict)):
+                    return [Data(data=article) for article in result] if isinstance(result, list) else [Data(data=result)]
+                result = pprint.pformat(result)
+                try:
+                    return [Data(data=article) for article in ast.literal_eval(result)]
+                except Exception:
+                    return [Data(data={"result": result})]
+
+            # Generic getattr handlers (rate-limited)
+            def _call_method():
+                return getattr(ticker, method.value)()
+
+            result = _call_with_rate_and_retry(_call_method)
+            result = pprint.pformat(result)
+            return [Data(data={"result": result})]
 
         except Exception as e:
             error_message = f"Error retrieving data: {e}"
             logger.debug(error_message)
             self.status = error_message
             raise ToolException(error_message) from e
-
-        return data_list
