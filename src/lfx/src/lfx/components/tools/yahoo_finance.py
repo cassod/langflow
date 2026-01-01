@@ -27,6 +27,7 @@ CACHE_MAX_ENTRIES = int(os.environ.get("YFINANCE_CACHE_MAX_ENTRIES", "512"))
 
 # Simple in-memory TTL cache for history results
 # Structure: _history_cache[cache_key] = (timestamp_seconds, records)
+# Use setdefault in helpers to ensure the dict exists even if something odd happens at import time.
 _history_cache: dict[str, tuple[float, object]] = {}
 
 
@@ -36,14 +37,16 @@ def _make_cache_key_for_history(symbol: str, start_date: str | None, end_date: s
 
 
 def _get_cached_history(cache_key: str):
-    entry = _history_cache.get(cache_key)
+    # Ensure the cache dict exists (defensive)
+    cache = globals().setdefault("_history_cache", {})
+    entry = cache.get(cache_key)
     if not entry:
         return None
     ts, records = entry
     if time.time() - ts > CACHE_TTL_SECONDS:
         # expired
         try:
-            del _history_cache[cache_key]
+            del cache[cache_key]
         except KeyError:
             pass
         return None
@@ -51,15 +54,17 @@ def _get_cached_history(cache_key: str):
 
 
 def _set_cached_history(cache_key: str, records: object):
+    # Ensure the cache dict exists (defensive)
+    cache = globals().setdefault("_history_cache", {})
     # Simple eviction if cache grows too big (remove oldest)
-    if len(_history_cache) >= CACHE_MAX_ENTRIES:
+    if len(cache) >= CACHE_MAX_ENTRIES:
         # remove oldest entry
-        oldest_key = min(_history_cache.items(), key=lambda kv: kv[1][0])[0]
+        oldest_key = min(cache.items(), key=lambda kv: kv[1][0])[0]
         try:
-            del _history_cache[oldest_key]
+            del cache[oldest_key]
         except KeyError:
             pass
-    _history_cache[cache_key] = (time.time(), records)
+    cache[cache_key] = (time.time(), records)
 
 
 # Token bucket rate limiter (per-process)
@@ -102,11 +107,13 @@ class TokenBucket:
 _token_bucket = TokenBucket(rate_per_min=RATE_PER_MIN, capacity=TOKEN_BUCKET_CAPACITY)
 
 # Retry wrapper: try to use tenacity if available, otherwise a simple fallback
+# Ensure the symbol is always defined to avoid NameError if import fails earlier
+TENACITY_AVAILABLE = False
 try:
-    import tenacity
+    import tenacity  # type: ignore
 
     TENACITY_AVAILABLE = True
-except Exception:
+except ImportError:
     TENACITY_AVAILABLE = False
 
 
@@ -286,13 +293,26 @@ to access financial data and market information from Yahoo! Finance."""
     def _yahoo_finance_tool(
         self,
         symbol: str,
-        method: YahooFinanceMethod,
+        method: YahooFinanceMethod | str,
         num_news: int | None = 5,
         start_date: str | None = None,
         end_date: str | None = None,
         period: str = "1y",
         interval: str = "1d",
     ) -> list[Data]:
+        # Normalize method to enum if needed (handles case where tool passes a string)
+        if isinstance(method, YahooFinanceMethod):
+            method_enum = method
+        else:
+            # try by enum value first (e.g., "get_history"), then by name (e.g., "GET_HISTORY")
+            try:
+                method_enum = YahooFinanceMethod(method)  # by value
+            except Exception:
+                try:
+                    method_enum = YahooFinanceMethod[method.upper()]  # by name
+                except Exception:
+                    raise ToolException(f"Unknown yahoo finance method: {method!r}")
+
         try:
             import yfinance as yf
         except ImportError as e:
@@ -303,7 +323,7 @@ to access financial data and market information from Yahoo! Finance."""
 
         try:
             # For history, check cache first (cache misses go through rate limiter and retry)
-            if method == YahooFinanceMethod.GET_HISTORY:
+            if method_enum == YahooFinanceMethod.GET_HISTORY:
                 cache_key = _make_cache_key_for_history(symbol, start_date, end_date, period, interval)
                 cached = _get_cached_history(cache_key)
                 if cached is not None:
@@ -333,12 +353,12 @@ to access financial data and market information from Yahoo! Finance."""
                 return [Data(data={"historical": records})]
 
             # For other methods, we call through the rate-limited wrapper
-            if method == YahooFinanceMethod.GET_INFO:
+            if method_enum == YahooFinanceMethod.GET_INFO:
                 result = _call_with_rate_and_retry(lambda: ticker.info)
                 result = pprint.pformat(result)
                 return [Data(data={"result": result})]
 
-            if method == YahooFinanceMethod.GET_NEWS:
+            if method_enum == YahooFinanceMethod.GET_NEWS:
                 # news may be a list; fetch via rate-limited wrapper
                 result = _call_with_rate_and_retry(lambda: ticker.news)
                 # slice if num_news provided
@@ -356,7 +376,7 @@ to access financial data and market information from Yahoo! Finance."""
 
             # Generic getattr handlers (rate-limited)
             def _call_method():
-                return getattr(ticker, method.value)()
+                return getattr(ticker, method_enum.value)()
 
             result = _call_with_rate_and_retry(_call_method)
             result = pprint.pformat(result)
